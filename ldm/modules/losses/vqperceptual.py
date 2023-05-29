@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from einops import repeat
 
-from taming.modules.discriminator.model import NLayerDiscriminator, weights_init
+from taming.modules.discriminator.model import NLayerDiscriminator, NLayerDiscriminator3D,weights_init
 from taming.modules.losses.lpips import LPIPS
 from taming.modules.losses.vqperceptual import hinge_d_loss, vanilla_d_loss
 
