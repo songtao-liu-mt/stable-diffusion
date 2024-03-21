@@ -192,7 +192,7 @@ class LPIPSWithDiscriminator3D(nn.Module):
 
             disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
             ae_factor = adopt_weight(self.disc_factor, global_step, threshold=self.ae_iter_start)
-            loss = ae_factor * (weighted_nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss)
+            loss = ae_factor * (weighted_nll_loss + self.kl_weight * kl_loss) + d_weight * disc_factor * g_loss
 
             log = {"{}/total_loss".format(split): loss.clone().detach().mean(), "{}/logvar".format(split): self.logvar.detach(),
                    "{}/kl_loss".format(split): kl_loss.detach().mean(), "{}/nll_loss".format(split): nll_loss.detach().mean(),

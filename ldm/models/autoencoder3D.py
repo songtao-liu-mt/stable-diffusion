@@ -6,10 +6,12 @@ from einops import rearrange
 
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
-from ldm.modules.diffusionmodules.model import Encoder, Decoder3D, InflatedConv3d
+from ldm.modules.diffusionmodules.model import Encoder3D, Decoder3D, InflatedConv3d, Encoder, Decoder
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 
 from ldm.util import instantiate_from_config
+import bitsandbytes as bnb
+import piq
 
 
 class AutoencoderKL3D(pl.LightningModule):
@@ -25,11 +27,13 @@ class AutoencoderKL3D(pl.LightningModule):
                  ):
         super().__init__()
         self.image_key = image_key
-        self.encoder = Encoder(**ddconfig)
+        self.encoder = Encoder3D(**ddconfig)
         self.decoder = Decoder3D(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
         assert ddconfig["double_z"]
-        self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
+        # self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
+        # self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.quant_conv = InflatedConv3d(2*ddconfig["z_channels"], 2*embed_dim, 1)
         self.post_quant_conv = InflatedConv3d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
         if colorize_nlabels is not None:
@@ -52,7 +56,7 @@ class AutoencoderKL3D(pl.LightningModule):
         print(f"Restored from {path}")
 
     def encode(self, x):
-        x = rearrange(x, "b c f h w -> (b f) c h w")
+        # x = rearrange(x, "b c f h w -> (b f) c h w")
         h = self.encoder(x)
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
@@ -70,12 +74,14 @@ class AutoencoderKL3D(pl.LightningModule):
             z = posterior.sample()
         else:
             z = posterior.mode()
-        z = rearrange(z, "(b f) c h w -> b c f h w", f=f)
+        # z = rearrange(z, "(b f) c h w -> b c f h w", f=f)
         dec = self.decode(z)
+        # dec = rearrange(dec, "(b f) c h w -> b c f h w", f=f)
         return dec, posterior
 
     def get_input(self, batch, k):
         x = batch[0] # b, f, h, w, c
+        # x = x.permute(0, 4, 1, 2, 3).to(memory_format=torch.contiguous_format).float()
         x = x.permute(0, 4, 1, 2, 3).to(memory_format=torch.contiguous_format).float()
         return x
 
@@ -109,35 +115,78 @@ class AutoencoderKL3D(pl.LightningModule):
         discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
 
+        rescale_inputs = ((inputs + 1.0) / 2.0).clamp_(0,1)
+        rescale_rec = ((reconstructions + 1.0) / 2.0).clamp_(0,1)
+        rescale_inputs = rearrange(rescale_inputs, "b c f h w -> (f b) c h w")
+        rescale_rec = rearrange(rescale_rec, "b c f h w -> (f b) c h w")
+
+        ssim = piq.ssim(rescale_inputs, rescale_rec)
+
+        psnr = piq.psnr(rescale_inputs, rescale_rec)
+
         self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
+        self.log("val/ssim", ssim)
+        self.log("val/psnr", psnr)
         self.log_dict(log_dict_ae)
         self.log_dict(log_dict_disc)
+        self.log_dict({"SSIM": ssim, "PSNR": psnr})
+        return self.log_dict
+
+    def test_step(self, batch, batch_idx):
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self(inputs)
+        aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="val")
+
+        discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
+                                            last_layer=self.get_last_layer(), split="val")
+
+        rescale_inputs = ((inputs + 1.0) / 2.0).clamp_(0,1)
+        rescale_rec = ((reconstructions + 1.0) / 2.0).clamp_(0,1)
+        rescale_inputs = rearrange(rescale_inputs, "b c f h w -> (f b) c h w")
+        rescale_rec = rearrange(rescale_rec, "b c f h w -> (f b) c h w")
+
+        ssim = piq.ssim(rescale_inputs, rescale_rec)
+
+        psnr = piq.psnr(rescale_inputs, rescale_rec)
+        
+
+        self.log("test/rec_loss", log_dict_ae["val/rec_loss"])
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+        self.log_dict({"SSIM": ssim, "PSNR": psnr})
         return self.log_dict
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        # opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
-                                  # list(self.decoder.parameters())+
-                                  # list(self.quant_conv.parameters())+
-                                  # list(self.post_quant_conv.parameters()),
-                                  # lr=lr, betas=(0.5, 0.9))
-        self.encoder.requires_grad_(False)
-        self.decoder.requires_grad_(False)
-        trainable_modules = ['temp', 'mid.attn_2', 'conv_out']
-        trainable_params=[]
-        for name, module in self.decoder.named_modules():
-            for prefix in trainable_modules:
-                if  name.find(prefix) > -1:
-                # if name.endswith(tuple(trainable_modules)):
-                    print(name)
-                    for nn, params in module.named_parameters():
-                        print(nn)
-                        params.requires_grad_(True)
-                        trainable_params.append(params)
-        # opt_ae = torch.optim.Adam(self.decoder.parameters(),     # only fintuning 3D decoders
-        opt_ae = torch.optim.Adam(trainable_params,     # only fintuning 3D decoders
-                                    lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+        opt_ae = bnb.optim.Adam8bit(list(self.encoder.parameters())+
+                                  list(self.decoder.parameters())+
+                                  list(self.quant_conv.parameters())+
+                                  list(self.post_quant_conv.parameters()),
+                                  lr=lr, betas=(0.5, 0.9))
+        # self.encoder.requires_grad_(False)
+        # self.decoder.requires_grad_(False)
+        # trainable_modules = ['temp', 'mid.attn_2', 'conv_out']
+        # trainable_params=[]
+        # for name, module in self.encoder.named_modules():
+            # for prefix in trainable_modules:
+                # if  name.find(prefix) > -1:
+                # # if name.endswith(tuple(trainable_modules)):
+                    # for nn, params in module.named_parameters():
+                        # params.requires_grad_(True)
+                        # trainable_params.append(params)
+        # for name, module in self.decoder.named_modules():
+            # for prefix in trainable_modules:
+                # if  name.find(prefix) > -1:
+                # # if name.endswith(tuple(trainable_modules)):
+                    # for nn, params in module.named_parameters():
+                        # params.requires_grad_(True)
+                        # trainable_params.append(params)
+        # opt_ae = torch.optim.Adam(trainable_params,     # only fintuning 3D decoders
+        # opt_ae = bnb.optim.Adam8bit(trainable_params,     # only fintuning 3D decoders
+                                    # lr=lr, betas=(0.5, 0.9))
+        # opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+        opt_disc = bnb.optim.Adam8bit(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9))
         return [opt_ae, opt_disc], []
 

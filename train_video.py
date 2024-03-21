@@ -16,6 +16,7 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.strategies import DDPStrategy
 
 from ldm.data.webvid import get_video_dataloader
 from ldm.util import instantiate_from_config, save_videos_grid
@@ -147,7 +148,7 @@ class SetupCallback(Callback):
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
@@ -181,15 +182,15 @@ class SetupCallback(Callback):
 
 class ImageLogger(Callback):
     def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=True,
-                 rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
+                 rescale=True, disabled=False, log_on_batch_idx=True, log_first_step=False,
                  log_images_kwargs=None):
         super().__init__()
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
-        }
+        self.logger_log_images = {}
+            # pl.loggers.TestTubeLogger: self._testtube,
+        # }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -198,17 +199,6 @@ class ImageLogger(Callback):
         self.log_on_batch_idx = log_on_batch_idx
         self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
         self.log_first_step = log_first_step
-
-    @rank_zero_only
-    def _testtube(self, pl_module, images, batch_idx, split):
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k])
-            grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
-
-            tag = f"{split}/{k}"
-            pl_module.logger.experiment.add_image(
-                tag, grid,
-                global_step=pl_module.global_step)
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -230,6 +220,7 @@ class ImageLogger(Callback):
                 callable(pl_module.log_images) and
                 self.max_images > 0):
             logger = type(pl_module.logger)
+
 
             is_train = pl_module.training
             if is_train:
@@ -266,11 +257,15 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx,):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+        if not self.disabled and (batch_idx > 0 or self.log_first_step):
+            self.log_img(pl_module, batch, batch_idx, split="test")
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx,):
         if not self.disabled and pl_module.global_step > 0:
             self.log_img(pl_module, batch, batch_idx, split="val")
         if hasattr(pl_module, 'calibrate_grad_norm'):
@@ -282,13 +277,13 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        torch.cuda.reset_peak_memory_stats(trainer.strategy.root_device.index)
+        torch.cuda.synchronize(trainer.strategy.root_device.index)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module):
+        torch.cuda.synchronize(trainer.strategy.root_device.index)
+        max_memory = torch.cuda.max_memory_allocated(trainer.strategy.root_device.index) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
@@ -391,7 +386,7 @@ if __name__ == "__main__":
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
-        trainer_config["accelerator"] = "ddp"
+        trainer_config["accelerator"] = "cuda"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not "gpus" in trainer_config:
@@ -410,6 +405,7 @@ if __name__ == "__main__":
         if opt.resume:
             model.load_state_dict(ckpt['state_dict'], strict=False)
 
+
         # trainer and callbacks
         trainer_kwargs = dict()
 
@@ -424,15 +420,16 @@ if __name__ == "__main__":
                     "id": nowname,
                 }
             },
-            "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
+            "tensorboard": {
+                "target": "pytorch_lightning.loggers.TensorBoardLogger",
                 "params": {
-                    "name": "testtube",
+                    "name": "tensorbord",
                     "save_dir": logdir,
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
+        # default_logger_cfg = default_logger_cfgs["testtube"]
+        default_logger_cfg = default_logger_cfgs["tensorboard"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -469,7 +466,7 @@ if __name__ == "__main__":
         # add callback which sets up log directory
         default_callbacks_cfg = {
             "setup_callback": {
-                "target": "main.SetupCallback",
+                "target": "train_video.SetupCallback",
                 "params": {
                     "resume": opt.resume,
                     "now": now,
@@ -481,7 +478,7 @@ if __name__ == "__main__":
                 }
             },
             "image_logger": {
-                "target": "main.ImageLogger",
+                "target": "train_video.ImageLogger",
                 "params": {
                     "batch_frequency": 750,
                     "max_images": 4,
@@ -489,14 +486,14 @@ if __name__ == "__main__":
                 }
             },
             "learning_rate_logger": {
-                "target": "main.LearningRateMonitor",
+                "target": "train_video.LearningRateMonitor",
                 "params": {
                     "logging_interval": "step",
                     # "log_momentum": True
                 }
             },
             "cuda_callback": {
-                "target": "main.CUDACallback"
+                "target": "train_video.CUDACallback"
             },
         }
         if version.parse(pl.__version__) >= version.parse('1.4.0'):
@@ -533,11 +530,13 @@ if __name__ == "__main__":
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
+        trainer_kwargs["strategy"]= DDPStrategy(find_unused_parameters=True)
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
 
         # data
         data = get_video_dataloader()
+        test_data = get_video_dataloader(test=True)
 
         # configure learning rate
         base_lr = config.model.base_learning_rate
@@ -591,7 +590,7 @@ if __name__ == "__main__":
                 melk()
                 raise
         if not opt.no_test and not trainer.interrupted:
-            trainer.test(model, data)
+            trainer.test(model, test_data)
     except Exception:
         if opt.debug and trainer.global_rank == 0:
             try:

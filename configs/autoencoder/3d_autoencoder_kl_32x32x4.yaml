@@ -4,11 +4,12 @@ model:
   params:
     monitor: "val/rec_loss"
     embed_dim: 4
+    ckpt_path: "models/first_stage_models/kl-f8/model_noD.ckpt"
     lossconfig:
       target: ldm.modules.losses.LPIPSWithDiscriminator3D
       params:
-        disc_start: 1
-        ae_start: 6000
+        disc_start: 5000
+        ae_start: 1
         kl_weight: 0.000001
         disc_weight: 0.5
 
@@ -23,6 +24,7 @@ model:
       num_res_blocks: 2
       attn_resolutions: [ ]
       dropout: 0.0
+      checkpoint: False
 
 lightning:
   callbacks:
@@ -35,5 +37,6 @@ lightning:
 
   trainer:
     benchmark: True
-    accumulate_grad_batches: 2
+    accelerator: "cuda"
+    accumulate_grad_batches: 1
     precision: 16
